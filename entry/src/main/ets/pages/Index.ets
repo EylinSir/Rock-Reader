@@ -26,7 +26,7 @@ import {
   STATUS_READING,
   STATUS_UNREAD
 } from '../engine/shelf/ShelfRules';
-import { BookRecord, ShelfItem } from '../common/Types';
+import { BookRecord, ProgressSnapshot, ShelfItem } from '../common/Types';
 import { Palette, paletteOf, THEME_DARK, ThemeName } from '../common/Theme';
 import { applyThemeToSystem } from '../common/SystemBar';
 import { RR_FS_DISPLAY, RR_FS_TITLE, RR_FS_HEADING, RR_FS_BODY, RR_FS_LABEL, RR_FS_META, RR_FS_DIGIT, RR_FS_MICRO, RR_SP_MD, RR_SP_LG, RR_SP_XL, RR_SP_2XL, RR_SP_3XL, RR_SP_4XL, RR_SP_5XL, RR_RADIUS_COVER, RR_RADIUS_SM, RR_RADIUS_MD, RR_RADIUS_CARD } from '../theme/RrTokens';
@@ -70,10 +70,12 @@ struct Index {
   // 「用其他应用打开」带进来的待导入 uri —— EntryAbility 收到后写进 AppStorage，这里接住。
   // 键名两边都写死（ArkUI 装饰器只接受字面量，抽不成常量），改要一起改。
   @StorageLink('pendingImportUri') @Watch('onIncomingFile') incomingUri: string = '';
-  // 阅读页**写完进度库之后**发的信号（Reader.persistProgress 的 Promise.all 完成时 set）。
-  // 没有它的话：返回书架时 onPageShow 的 load 会和写库竞态，进度条显示旧值（审核驳回第 3 条）。
+  // 阅读页**写完进度库之后**推来的进度快照（Reader.persistProgress 的 Promise.all 完成时 set）。
+  // 收到后**直接用快照改本地 @State**（applyProgress）—— 不查库、不等 onPageShow、不依赖版本行为：
+  // 2026-10-12 华为 1.0.1 审核反馈：API 24 真机（nova 14 Pro / Pura 80 Ultra）上，
+  // 只靠 onPageShow + 查库的链路仍然不刷新。
   // 键名两边都写死（同上：装饰器只接受字面量），改要一起改。
-  @StorageLink('progressSavedAt') @Watch('onProgressSaved') progressSavedAt: number = 0;
+  @StorageLink('progressSaved') @Watch('onProgressSaved') progressSaved: ProgressSnapshot = { bookId: '', percent: 0 };
 
   /** 长按后弹出的菜单/输入框 */
   @State editorMode: string = MODE_NONE;
@@ -102,6 +104,8 @@ struct Index {
   private visible: boolean = false;
   /** 不可见期间收到过进度保存信号 → onPageShow 时补一次重拉 */
   private pendingReload: boolean = false;
+  /** 最近一次收到的进度快照（onPageShow 兜底用 —— 万一 @Watch 没触发） */
+  private lastSnap: ProgressSnapshot | null = null;
 
   aboutToAppear(): void {
     this.prefs.open(this.getUIContext().getHostContext() as Context);
@@ -122,14 +126,51 @@ struct Index {
     this.onIncomingFile();
   }
 
-  /** 阅读页进度写库完成 → 重拉书架数据（修"返回书架进度不刷新"，审核驳回第 3 条） */
+  /**
+   * 阅读页进度写库完成 → 收到快照（修"返回书架进度不刷新"：审核驳回第 3 条 + 1.0.1 审核反馈）。
+   *
+   * 三层刷新，逐层兜底：
+   *   ① **快照直达**：直接用快照改本地 @State → ArkUI 立即重渲染（不查库、不等 onPageShow、不怕版本差异）
+   *   ② 可见时 load()：与库对齐
+   *   ③ 不可见时记 pendingReload：等 onPageShow 补拉
+   */
   onProgressSaved(): void {
-    hilog.info(DOMAIN, TAG, 'onProgressSaved fired, visible=%{public}s', String(this.visible));
+    const snap: ProgressSnapshot = this.progressSaved;
+    this.lastSnap = snap;
+    hilog.info(DOMAIN, TAG, 'onProgressSaved fired, visible=%{public}s, book=%{public}s, percent=%{public}f',
+      String(this.visible), snap.bookId, snap.percent);
+    if (snap.bookId.length > 0) {
+      this.applyProgress(snap.bookId, snap.percent);
+    }
     if (this.visible) {
       this.load();
     } else {
       // 页面不可见时 load() 就算拿到新值也不重渲染（ArkUI 行为）→ 攒着，等 onPageShow 补拉
       this.pendingReload = true;
+    }
+  }
+
+  /**
+   * 用快照直接改本地状态。ShelfItem 只有 `book` + `percent` 两个字段 ⇒ 重建对象让 @State 感知到变化。
+   * 「在读」等状态标签由 percent 推导（statusOf），所以 percent 一变，标签与进度条一起对。
+   */
+  private applyProgress(bookId: string, percent: number): void {
+    let changed: boolean = false;
+    const next: ShelfItem[] = [];
+    for (let i: number = 0; i < this.items.length; i++) {
+      const it: ShelfItem = this.items[i];
+      if (it.book.id === bookId && it.percent !== percent) {
+        next.push({ book: it.book, percent: percent });
+        changed = true;
+      } else {
+        next.push(it);
+      }
+    }
+    if (changed) {
+      this.items = next;
+    }
+    if (this.resume !== null && this.resume.book.id === bookId && this.resume.percent !== percent) {
+      this.resume = { book: this.resume.book, percent: percent };
     }
   }
 
@@ -142,6 +183,10 @@ struct Index {
     // **必须重新拉一次书籍与进度**（2026-09-26 审核驳回第 3 条修的就是这里）：
     // 以前只在 aboutToAppear 里 load 过一次，从阅读页返回书架时进度条不刷新，
     // 要杀掉应用重进才更新 —— 审核员实测到了。本地数据库查一次很快，直接重查最稳。
+    // 先用最近快照把 UI 校正（万一 @Watch 没触发 —— 不同 API 版本行为有差异），再查库对齐
+    if (this.lastSnap !== null && this.lastSnap.bookId.length > 0) {
+      this.applyProgress(this.lastSnap.bookId, this.lastSnap.percent);
+    }
     this.load();
     // 补拉：不可见期间攒下的进度信号（见 onProgressSaved）
     if (this.pendingReload) {

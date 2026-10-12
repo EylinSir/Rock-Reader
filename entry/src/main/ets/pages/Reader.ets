@@ -17,7 +17,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { router } from '@kit.ArkUI';
 import { BookDb } from '../data/BookDb';
 import { ReaderPrefs } from '../data/ReaderPrefs';
-import { BookRecord, ChapterRow, ReadingProgress } from '../common/Types';
+import { BookRecord, ChapterRow, ProgressSnapshot, ReadingProgress } from '../common/Types';
 import { BookSource, createBookSource } from '../engine/parser/BookSource';
 import {
   fontSizeFpOf,
@@ -825,7 +825,12 @@ struct Reader {
       this.db.touchLastRead(this.book.id, p.updatedAt)
     ]).then(() => {
       hilog.info(DOMAIN, TAG, 'progress saved ok, sending signal');
-      AppStorage.setOrCreate('progressSavedAt', Date.now());
+      // **带快照发信号**：书架 Index 的 @Watch 收到后直接改本地 @State 刷新 UI
+      // （不查库、不等 onPageShow、不依赖版本行为）。
+      // 2026-10-12 华为 1.0.1 审核反馈：API 24 真机上只靠 onPageShow + 查库的链路仍不刷新。
+      const snap: ProgressSnapshot = { bookId: p.bookId, percent: p.percent };
+      AppStorage.setOrCreate('progressSaved', snap);
+      AppStorage.setOrCreate('progressSavedAt', p.updatedAt);
     }).catch((e: Error) => {
       hilog.error(DOMAIN, TAG, 'save progress failed: %{public}s', e.message);
     });

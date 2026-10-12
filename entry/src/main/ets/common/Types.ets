@@ -34,6 +34,19 @@ export interface ReadingProgress {
   updatedAt: number;
 }
 
+/**
+ * 阅读页写完进度库后**推给书架的进度快照**（经 AppStorage 的 'progressSaved' 键）。
+ *
+ * 为什么需要它：只靠"onPageShow 重查库"的链路在 **API 24 真机上不刷新**
+ * （华为 1.0.1 审核反馈，nova 14 Pro / Pura 80 Ultra 实测）。
+ * 收到快照后书架**直接改本地 @State** → ArkUI 立即重渲染：不查库、不等 onPageShow、不依赖版本行为。
+ */
+export interface ProgressSnapshot {
+  bookId: string;
+  /** 0~1 */
+  percent: number;
+}
+
 export interface ChapterRow {
   bookId: string;
   index: number;

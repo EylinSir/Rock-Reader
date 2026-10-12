@@ -1,6 +1,6 @@
 /**
  * 书架页
- * 设计依据：docs/v1-design.md §8 —— 黑底白字、等宽数码、书封 0 圆角、卡片 12 圆角、空态不放营销文案
+ * 设计依据：docs/v1-design.md §8 —— 黑底白字、等宽数码、书封 4vp 圆角、卡片 16vp 圆角（官方档位）、空态不放营销文案
  * 主题：色板来自 common/Theme.ets（运行时切换，与系统深浅色解耦）
  *
  * 书架的分组/进度规则全部在 engine/shelf/ShelfRules.ets（纯逻辑、可单测），本页只做渲染与交互。
@@ -418,7 +418,7 @@ struct Index {
       .width(size)
       .height(size * 1.4)
       .backgroundColor(this.palette.cover)
-      .borderRadius(RR_RADIUS_COVER)                       // 书封 0 圆角（已确认）
+      .borderRadius(RR_RADIUS_COVER)                       // 书封 4vp（官方超小圆角）
       .justifyContent(FlexAlign.Center)
     }
   }

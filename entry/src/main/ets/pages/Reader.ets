@@ -16,7 +16,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { router } from '@kit.ArkUI';
 import { BookDb } from '../data/BookDb';
-import { ReaderPrefs } from '../data/ReaderPrefs';
+import { ReaderPrefs, TTS_PERSON_DEFAULT } from '../data/ReaderPrefs';
 import { BookRecord, ChapterRow, ProgressSnapshot, ReadingProgress } from '../common/Types';
 import { BookSource, createBookSource } from '../engine/parser/BookSource';
 import {
@@ -35,6 +35,7 @@ import { FontStore } from '../data/FontStore';
 import { MIN_SESSION_MS, ReadSession } from '../engine/stats/ReadStats';
 import { FontEntry } from '../common/FontCatalog';
 import { TextPaginator } from '../engine/paginator/TextPaginator';
+import { TtsEngine, TtsCallbacks } from '../engine/tts/TtsEngine';
 import { Palette, paletteOf, themeLabel, THEME_DARK, THEME_GREEN, THEME_LIGHT, THEME_SEPIA, ThemeName } from '../common/Theme';
 import { applyThemeToSystem } from '../common/SystemBar';
 import { RR_FS_TITLE, RR_FS_HEADING, RR_FS_BODY, RR_FS_LABEL, RR_FS_META, RR_FS_DIGIT, RR_FS_MICRO, RR_SP_SM, RR_SP_MD, RR_SP_LG, RR_SP_XL, RR_SP_2XL, RR_SP_3XL, RR_SP_4XL, RR_SP_5XL, RR_SP_6XL, RR_SP_VOID, RR_SP_TOP, RR_RADIUS_COVER } from '../theme/RrTokens';
@@ -239,12 +240,89 @@ struct Reader {
   /** 章加载失败态：true 时 persistProgress 禁止落库（防进度被清成 0，审查报告 B2） */
   private failed: boolean = false;
 
+  // ---- 朗读（TTS，2026-10-17 加）----
+  /**
+   * 引擎单例跨 Reader 页生命周期复用（aboutToDisappear 才 shutdown）。
+   * 能力探测在 aboutToAppear 触发；模拟器无 TTS 能力 → ttsSupported 保持 false
+   * → 入口不渲染（用户完全感知不到，findings §15）。
+   */
+  private tts: TtsEngine = TtsEngine.shared();
+  /** 设备支持 TTS（探测结论）；false = 隐藏全部朗读入口 */
+  @State ttsSupported: boolean = false;
+  /** 朗读会话激活（页脚显示播放条替换章名/页码） */
+  @State speakActive: boolean = false;
+  /** 当前音色 person（设置面板选中态；试听失败自动回退默认） */
+  @State ttsPerson: number = TTS_PERSON_DEFAULT;
+  /** 暂停中（继续/暂停 文字切换） */
+  @State speakPaused: boolean = false;
+  /** begin 已发起但首段未开播的瞬态（createEngine 异步） */
+  @State speakPreparing: boolean = false;
+  /** 播放条进度文案，如 '3/12'；准备中为 '准备中' */
+  @State speakProgress: string = '';
+
   aboutToAppear(): void {
     // 下载的字体**每次启动都要重新注册**（registerFont 只在进程内存活，不持久化）
     const store: FontStore = new FontStore(this.getUIContext().getHostContext() as Context);
     this.fontStore = store;
     this.registerLocalFonts(store);
+    this.initTts();
     this.init();
+  }
+
+  /** 朗读初始化：挂回调 + 探测能力。探测失败（模拟器/低端机）= 入口不出现，零感知 */
+  private initTts(): void {
+    const tts: TtsEngine = this.tts;
+    tts.setSpeed(this.prefs.getTtsSpeed());
+    this.ttsPerson = this.prefs.getTtsPerson();
+    tts.setPerson(this.ttsPerson);
+    // ArkTS 坑（2026-10-17 实测）：对象字面量的**属性值为箭头函数表达式**时会踩
+    // arkts-no-untyped-obj-literals（类型推导失效）；先用显式函数类型变量接住，再作属性值。
+    // （方法语法 onXxx(): void {} 也可过，但闭包要抓 this —— 方法内 this 指向字面量本身，不可用。）
+    const onSegStart: (index: number, total: number) => void = (index: number, total: number): void => {
+      this.speakPreparing = false;
+      this.speakPaused = false;
+      this.speakActive = true;
+      this.speakProgress = `${index + 1}/${total}`;
+    };
+    const onAllDone: () => void = (): void => {
+      // 本页读完：能翻页就翻（showPage 会自动重载新页续读，见 showPage 尾部），
+      // 全书末页则收工。跨章同理：openChapter 最终也走 showPage。
+      const canForward: boolean = this.pageIndex < this.pageCount - 1
+        || this.chapterIndex < this.chapterCount - 1;
+      if (canForward) {
+        this.turnPage(1);
+      } else {
+        this.speakActive = false;
+        this.speakPaused = false;
+        this.speakProgress = '';
+      }
+    };
+    const onErr: (msg: string) => void = (msg: string): void => {
+      this.speakPreparing = false;
+      this.speakActive = false;
+      this.speakPaused = false;
+      this.speakProgress = '';
+      // 音色试听失败（如凌飞哲未下载 → createEngine 1002300003）：
+      // 选中态/prefs/引擎全部回退默认音色 —— 别把用户卡在坏选项上，
+      // 且给一句明确提示（静默失败最难排查）。
+      if (this.ttsPerson !== TTS_PERSON_DEFAULT) {
+        this.ttsPerson = TTS_PERSON_DEFAULT;
+        this.prefs.setTtsPerson(TTS_PERSON_DEFAULT);
+        this.tts.setPerson(TTS_PERSON_DEFAULT);
+        this.hint = '该音色暂不可用，已切回聆小珊';
+        return;
+      }
+      this.hint = msg.length > 0 ? msg : '朗读出错，请重试';
+    };
+    const cbs: TtsCallbacks = new TtsCallbacks();
+    cbs.onSegmentStart = onSegStart;
+    cbs.onAllDone = onAllDone;
+    cbs.onError = onErr;
+    tts.setCallbacks(cbs);
+    tts.probe((supported: boolean) => {
+      this.ttsSupported = supported;
+      hilog.info(DOMAIN, TAG, 'tts probe: supported=%{public}s', String(supported));
+    });
   }
 
   /** 把已下载字体注册进 ArkUI（渲染用）；测量端由 TextPaginator 用文件路径单独挂 */
@@ -290,6 +368,11 @@ struct Reader {
     }
     this.registerLocalFonts(this.fontStore);
     this.applyPrefsToLayout();
+    // 语速偏好可能刚在设置页改过（设置页改语速是期二 UI；此处先接上，成本 0）
+    this.tts.setSpeed(this.prefs.getTtsSpeed());
+    // 音色偏好同步（设置里试听失败回退过 prefs；此处以 prefs 为准对齐引擎）
+    this.ttsPerson = this.prefs.getTtsPerson();
+    this.tts.setPerson(this.ttsPerson);
     // 从独立设置页返回：浮层全部复位（审查报告 B23 —— 菜单卡在开启态）
     this.showMenu = false;
     this.showToc = false;
@@ -337,11 +420,22 @@ struct Reader {
   onPageHide(): void {
     this.persistProgress(true);
     this.flushSession();
+    // 回后台暂停朗读（后台/锁屏播放是期二 AVSession 的事，一期从简：停在这里）
+    if (this.speakActive) {
+      this.tts.pause();
+      this.speakPaused = true;
+    }
   }
 
   aboutToDisappear(): void {
     this.persistProgress(true);
     this.flushSession();
+    // 无条件 shutdown（幂等）：speakActive 时要停播；仅探测过没开读时，
+    // probe 留下的引擎也必须释放（否则进程内常驻音频资源）
+    this.tts.shutdown();
+    this.speakActive = false;
+    this.speakPaused = false;
+    this.speakProgress = '';
     if (this.source !== null) {
       this.source.release();
     }
@@ -540,6 +634,91 @@ struct Reader {
       ? 0
       : (this.chapterIndex + this.pagePercent) / this.chapterCount;
     this.persistProgress(false);
+    // 朗读中翻页（用户手动翻 / onAllDone 自动翻 / 跨章 openChapter 后）：重载新页续读。
+    // 手动翻页 = 阅读位置变了，朗读跟着走（微信读书行为，别让耳朵和眼睛岔开）。
+    // 暂停中翻页 = 换页不自动开读，点「继续」从新页第一段来（见 toggleSpeak）。
+    if (this.speakActive) {
+      this.reloadSpeakCurrent(this.speakPaused);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // 朗读（TTS）控制
+  // ------------------------------------------------------------------
+
+  /** 开始朗读当前页（topBar「朗读」入口 / 暂停后「继续」共用） */
+  private startSpeak(): void {
+    if (!this.ttsSupported) {
+      return;
+    }
+    const n: number = this.tts.loadText(this.pageText);
+    if (n === 0) {
+      this.hint = '本页没有可读的内容';
+      return;
+    }
+    this.speakPreparing = true;
+    this.speakProgress = '准备中';
+    this.speakPaused = false;
+    if (this.tts.begin()) {
+      // 同步路径：引擎已就绪，首段已 speak（onSegmentStart 会到）
+      this.speakActive = true;
+      this.speakPreparing = false;
+    }
+    // begin 返回 false 且无 onError 到 = 引擎创建中的瞬态：
+    // speakActive 由 onSegmentStart 置 true；期间播放条不显示（避免"假播放条"）
+  }
+
+  /** 播放/暂停切换（topBar 按钮与页脚播放条共用） */
+  private toggleSpeak(): void {
+    if (!this.speakActive) {
+      this.startSpeak();
+      return;
+    }
+    if (this.speakPaused) {
+      // 继续：队列可能已被翻页时的 reloadSpeakCurrent 复位（state=idle），
+      // 此时 resume 无效 → 走 begin 从新页第一段读
+      if (this.tts.state === 'paused') {
+        this.tts.resume();
+      } else {
+        this.tts.begin();
+      }
+      this.speakPaused = false;
+      this.speakPreparing = true;
+      this.speakProgress = '准备中';
+    } else {
+      this.tts.pause();
+      this.speakPaused = true;
+    }
+  }
+
+  /** 停止朗读（收工：复位全部状态） */
+  private stopSpeak(): void {
+    this.tts.stop();
+    this.speakActive = false;
+    this.speakPaused = false;
+    this.speakPreparing = false;
+    this.speakProgress = '';
+  }
+
+  /**
+   * 翻页后重载当前页文本续读。
+   * @param keepPaused true = 暂停中翻页：只换文本不开读（点「继续」才读），
+   *        此时队列停在 idle + cursor 0 待续；false = 立即开读新页第一段。
+   */
+  private reloadSpeakCurrent(keepPaused: boolean): void {
+    const n: number = this.tts.loadText(this.pageText);
+    if (n === 0) {
+      this.stopSpeak();
+      return;
+    }
+    if (keepPaused) {
+      // 队列 load 后 state=idle/cursor=-1；「继续」按钮走 begin 分支（见 toggleSpeak）
+      this.speakProgress = '已换页';
+      return;
+    }
+    this.speakPreparing = true;
+    this.speakProgress = '准备中';
+    this.tts.begin();
   }
 
   // ------------------------------------------------------------------
@@ -865,6 +1044,19 @@ struct Reader {
         .fontSize(RR_FS_MICRO)
         .fontFamily('monospace')
         .fontColor(this.palette.text3)
+      // 朗读入口：仅设备支持 TTS 时渲染（模拟器/低端机完全看不到，findings §15）。
+      // 放标题行而不是底部四等分按钮行 —— 不破坏「上一章/目录/Aa/下一章」的构图，
+      // 且与章节计数同款等宽小字，视觉重量对等。
+      if (this.ttsSupported) {
+        Text(this.speakActive ? (this.speakPaused ? '继续' : '暂停') : '朗读')
+          .fontSize(RR_FS_MICRO)
+          .fontFamily('monospace')
+          .fontColor(this.palette.text)
+          .margin({ left: RR_SP_MD })
+          .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
+          .accessibilityText(this.speakActive ? '暂停朗读' : '开始朗读')
+          .onClick(() => this.toggleSpeak())
+      }
     }
     .width('100%')
     .alignItems(VerticalAlign.Center)
@@ -1163,6 +1355,38 @@ struct Reader {
       .onClick(() => this.pickFont(family))
   }
 
+  /** 音色 chip（设置面板）：选中即试听当前页 —— 官方无网页试听页，
+   *  RockReader 自己就是最佳试听器（同一引擎，模拟器可出声） */
+  @Builder
+  personChip(label: string, person: number) {
+    Text(label)
+      .fontSize(RR_FS_LABEL)
+      .fontColor(this.ttsPerson === person ? this.palette.bg : this.palette.text2)
+      .backgroundColor(this.ttsPerson === person ? this.palette.text : this.palette.card)
+      .borderWidth(1)
+      .borderColor(this.ttsPerson === person ? this.palette.text : this.palette.line)
+      .height(34)
+      .padding({ left: RR_SP_3XL, right: RR_SP_3XL })
+      .textAlign(TextAlign.Center)
+      .maxLines(1)
+      .stateStyles({ pressed: { opacity: 0.6 } })
+      .accessibilityText(`音色 ${label}`)
+      .responseRegion({ x: 0, y: -5, width: '100%', height: 44 })
+      .onClick(() => this.pickPerson(person))
+  }
+
+  /** 选音色：落盘 + 热切换引擎 + 立即试听当前页（失败走 onErr 回退默认） */
+  private pickPerson(person: number): void {
+    if (person === this.ttsPerson) {
+      return;
+    }
+    this.prefs.setTtsPerson(person);
+    this.ttsPerson = person;
+    // setPerson 内部会停旧引擎并 shutdown；随后 startSpeak 用新音色重建
+    this.tts.setPerson(person);
+    this.startSpeak();
+  }
+
   /** 设置抽屉：底出、不遮满（上半透出正文），改一下上面立刻跟着变 */
   @Builder
   settingsPanel() {
@@ -1244,6 +1468,38 @@ struct Reader {
       .width('100%')
       .padding({ left: RR_SP_4XL, right: RR_SP_4XL, top: RR_SP_3XL, bottom: RR_SP_3XL })
       .border({ width: { bottom: 1 }, color: this.palette.lineSoft })
+
+      // 音色行（仅设备支持 TTS 时出现；点选即试听当前页）
+      if (this.ttsSupported) {
+        Column() {
+          Row() {
+            Text('音色')
+              .fontSize(RR_FS_BODY)
+              .fontColor(this.palette.text)
+            Blank()
+            Text('点选试听')
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text3)
+          }
+          .width('100%')
+          .margin({ bottom: RR_SP_XL })
+
+          Scroll() {
+            Row({ space: 8 }) {
+              this.personChip('聆小珊（女）', 13)
+              this.personChip('凌飞哲（男）', 21)
+            }
+          }
+          .edgeEffect(EdgeEffect.Spring, { alwaysEnabled: true })
+          .scrollable(ScrollDirection.Horizontal)
+          .scrollBar(BarState.Off)
+          .width('100%')
+        }
+        .width('100%')
+        .padding({ left: RR_SP_4XL, right: RR_SP_4XL, top: RR_SP_3XL, bottom: RR_SP_3XL })
+        .border({ width: { bottom: 1 }, color: this.palette.lineSoft })
+      }
 
       Text('更多设置（字体下载 / 隐私）›')
         .fontSize(RR_FS_LABEL)
@@ -1417,40 +1673,82 @@ struct Reader {
           })
       )
 
-      // ---- 页脚（唯一常驻控件，极克制：等宽章名 + 页码）----
+      // ---- 页脚（唯一常驻控件）----
+      // 朗读激活时换成播放条（暂停/继续 + 段进度 + 停止），停播恢复章名/页码。
+      // 高度不变（FOOTER_VP=30）：文字按钮 + responseRegion 撑热区，不新增浮层。
       Column() {
-        Row() {
-          Text(this.chapterTitle)
-            .fontSize(RR_FS_MICRO)
-            .fontFamily('monospace')
-            .fontColor(this.palette.text3)
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Text(this.pageCount > 0 ? `${this.pageIndex + 1}/${this.pageCount}` : '')
-            .fontSize(RR_FS_MICRO)
-            .fontFamily('monospace')
-            .fontColor(this.palette.text3)
+        if (this.speakActive) {
+          Row() {
+            Text(this.speakPaused ? '继续' : '暂停')
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text)
+              .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
+              .accessibilityText(this.speakPaused ? '继续朗读' : '暂停朗读')
+              .onClick(() => this.toggleSpeak())
+            Text(this.speakPreparing ? '准备中' : this.speakProgress)
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text3)
+              .layoutWeight(1)
+              .textAlign(TextAlign.Center)
+            Text('停止')
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text)
+              .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
+              .accessibilityText('停止朗读')
+              .onClick(() => this.stopSpeak())
+          }
+          .width('100%')
+        } else {
+          Row() {
+            Text(this.chapterTitle)
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text3)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Text(this.pageCount > 0 ? `${this.pageIndex + 1}/${this.pageCount}` : '')
+              .fontSize(RR_FS_MICRO)
+              .fontFamily('monospace')
+              .fontColor(this.palette.text3)
+          }
+          .width('100%')
         }
-        .width('100%')
-        .padding({ left: this.marginVp, right: this.marginVp, bottom: RR_SP_2XL })
       }
+      .width('100%')
+      .padding({ left: this.marginVp, right: this.marginVp, bottom: RR_SP_2XL })
       .width('100%')
       .height(FOOTER_VP)
       .justifyContent(FlexAlign.End)
 
       // ---- 浮层：点屏中间才出现 ----
       if (this.showMenu) {
+        // 外层全屏包裹（继承 Stack 的 Bottom 对齐，铺满窗口）；
+        // 内层才是菜单本体 —— 朗读时高度让出页脚 FOOTER_VP，bottomBar 随之抬起，
+        // 页脚播放条（暂停/进度/停止）回到可点击区域。
+        // 反例（2026-10-18 实测）：直接给菜单 Column 缩高 + Bottom 对齐 =
+        // 顶部下移、底部不动，播放条照样被 bottomBar 尾部的空 onClick 吞。
         Column() {
-          this.topBar()
-          Blank()
-          this.bottomBar()
+          Column() {
+            this.topBar()
+            Blank()
+            this.bottomBar()
+          }
+          .width('100%')
+          .height(this.speakActive ? 'calc(100% - ' + FOOTER_VP + 'vp)' : '100%')
+          .onClick(() => {
+            this.showMenu = false;
+          })
         }
         .width('100%')
         .height('100%')
-        .onClick(() => {
-          this.showMenu = false;
-        })
+        // 自身对命中测试透明：让位出的页脚播放条区域要能点到 footer 的按钮
+        // （Default 模式下全屏容器自身会吞掉落点 —— 2026-10-18 实测，
+        // 不加这行播放条照样死区，只是不再被 bottomBar 盖而是被本层盖）
+        .hitTestBehavior(HitTestMode.Transparent)
       }
 
       // ---- 目录（左抽屉：不铺满窗口，右侧留白透出正文，点右侧关闭）----

@@ -25,6 +25,21 @@ const KEY_WEIGHT: string = 'weight_level';
 const KEY_PURIFY: string = 'purify_on';
 /** 简繁：'off' | 's2t' | 't2s' */
 const KEY_CONVERT: string = 'convert_mode';
+/** 朗读语速（TTS）；默认 1.0 常速，产品档位 0.5~2.0 */
+const KEY_TTS_SPEED: string = 'tts_speed';
+/** 朗读音色（TTS）；存 person 号。官方音色：13=聆小珊女声（内置推荐）、
+ *  21=凌飞哲男声（需 downloadVoice 下载）。8=劳拉是**英文**音色，中文书不列。 */
+const KEY_TTS_PERSON: string = 'tts_person';
+
+/** 朗读语速默认值（常速） */
+export const TTS_SPEED_DEFAULT: number = 1.0;
+/** 朗读语速档位（产品可选；TtsEngine 侧还有 0.2~2.0 的防御性夹取） */
+export const TTS_SPEED_MIN: number = 0.5;
+export const TTS_SPEED_MAX: number = 2.0;
+
+/** 音色白名单（脏值/历史值一律回默认）：聆小珊内置无需下载；凌飞哲需下载 */
+export const TTS_PERSON_DEFAULT: number = 13;
+export const TTS_PERSONS: number[] = [13, 21];
 
 export const CONVERT_OFF: string = 'off';
 
@@ -48,6 +63,8 @@ export class ReaderPrefs {
   private fontFamily: string = '';
   private purifyOn: boolean = true;
   private convertMode: string = CONVERT_OFF;
+  private ttsSpeed: number = TTS_SPEED_DEFAULT;
+  private ttsPerson: number = TTS_PERSON_DEFAULT;
 
   /** 幂等：重复调用直接返回 */
   open(ctx: Context): void {
@@ -62,6 +79,8 @@ export class ReaderPrefs {
       this.fontFamily = this.readText(store, KEY_FAMILY, '');
       this.purifyOn = this.readBool(store, KEY_PURIFY, true);
       this.convertMode = this.readText(store, KEY_CONVERT, CONVERT_OFF);
+      this.ttsSpeed = this.readTtsSpeed(store);
+      this.ttsPerson = this.readTtsPerson(store);
     } catch (e) {
       // 读不到就用默认档位（3/3/3 + 深色）—— 绝不因为偏好读取失败而读不了书
       hilog.error(DOMAIN, TAG, 'prefs open failed: %{public}s', JSON.stringify(e));
@@ -118,6 +137,24 @@ export class ReaderPrefs {
     return fallback;
   }
 
+  /** 朗读语速读取（夹取到产品档位范围，防历史脏值/手改 store） */
+  private readTtsSpeed(store: preferences.Preferences): number {
+    const raw: preferences.ValueType = store.getSync(KEY_TTS_SPEED, TTS_SPEED_DEFAULT);
+    if (typeof raw === 'number' && isFinite(raw)) {
+      return clampTtsSpeed(raw);
+    }
+    return TTS_SPEED_DEFAULT;
+  }
+
+  /** 音色读取（白名单校验：只认 13/21，其余回默认 13） */
+  private readTtsPerson(store: preferences.Preferences): number {
+    const raw: preferences.ValueType = store.getSync(KEY_TTS_PERSON, TTS_PERSON_DEFAULT);
+    if (typeof raw === 'number' && isFinite(raw)) {
+      return clampTtsPerson(raw);
+    }
+    return TTS_PERSON_DEFAULT;
+  }
+
   /**
    * 重新从 store 读一遍。
    * 必要性：设置页与阅读页各持一个 ReaderPrefs 实例，设置页改了档位后，
@@ -133,6 +170,8 @@ export class ReaderPrefs {
     this.fontFamily = this.readText(store, KEY_FAMILY, '');
     this.purifyOn = this.readBool(store, KEY_PURIFY, true);
     this.convertMode = this.readText(store, KEY_CONVERT, CONVERT_OFF);
+    this.ttsSpeed = this.readTtsSpeed(store);
+    this.ttsPerson = this.readTtsPerson(store);
   }
 
   getLevels(): LayoutLevels {
@@ -210,6 +249,28 @@ export class ReaderPrefs {
     this.flush();
   }
 
+  /** 朗读语速（产品档位 0.5~2.0，默认 1.0） */
+  getTtsSpeed(): number {
+    return this.ttsSpeed;
+  }
+
+  setTtsSpeed(v: number): void {
+    this.ttsSpeed = clampTtsSpeed(v);
+    this.put(KEY_TTS_SPEED, this.ttsSpeed);
+    this.flush();
+  }
+
+  /** 朗读音色 person（13/21；白名单外一律按默认处理） */
+  getTtsPerson(): number {
+    return this.ttsPerson;
+  }
+
+  setTtsPerson(v: number): void {
+    this.ttsPerson = clampTtsPerson(v);
+    this.put(KEY_TTS_PERSON, this.ttsPerson);
+    this.flush();
+  }
+
   private put(key: string, value: preferences.ValueType): void {
     if (this.store === null) {
       return;
@@ -230,4 +291,28 @@ export class ReaderPrefs {
       hilog.error(DOMAIN, TAG, 'prefs flush failed: %{public}s', e.message);
     });
   }
+}
+
+/** 朗读语速夹取（NaN 与非有限值回默认，防脏值把 TTS 搞崩） */
+function clampTtsSpeed(v: number): number {
+  if (!isFinite(v)) {
+    return TTS_SPEED_DEFAULT;
+  }
+  if (v < TTS_SPEED_MIN) {
+    return TTS_SPEED_MIN;
+  }
+  if (v > TTS_SPEED_MAX) {
+    return TTS_SPEED_MAX;
+  }
+  return v;
+}
+
+/** 音色白名单夹取（非 13/21 → 默认 13；凌飞哲下载失败由 TtsEngine 建引擎时报，不在这层） */
+function clampTtsPerson(v: number): number {
+  for (const p of TTS_PERSONS) {
+    if (v === p) {
+      return v;
+    }
+  }
+  return TTS_PERSON_DEFAULT;
 }

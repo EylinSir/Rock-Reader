@@ -133,6 +133,12 @@ const TAG: string = 'RockReader';
 
 /** 页脚高度（vp）：正文可用高度要扣掉 */
 const FOOTER_VP: number = 30;
+/**
+ * topBar 朗读入口喇叭图标边长（vp）—— SVG 三态（待机 / 暂停 / 播放）。
+ * 28vp：整图标 glyph 约 20vp，与返回键「‹」的字形同量级。
+ * （2026-10-19 党哥反馈 20vp 太小，且与相邻章号数字没有居中对齐。）
+ */
+const SPEAKER_ICON_VP: number = 28;
 /** 正文顶部留白（vp） */
 const HEADER_VP: number = 34;
 /** 每次翻页落一次进度太重 → 章内每 5 页落一次；切章 / 退出必落 */
@@ -1127,10 +1133,24 @@ struct Reader {
         .fontColor(this.palette.text3)
       // 朗读入口：仅设备支持 TTS 时渲染（探测失败的设备完全看不到）。
       // 放标题行而不是底部四等分按钮行 —— 不破坏「上一章/目录/Aa/下一章」的构图。
-      // 图标而非文字（党哥 2026-10-18 要求）：三态 = 待机描边喇叭 / 暂停实心单弧 /
-      // 播放实心双弧；热区在 Builder 内撑到 56×44 保证触摸标准。
+      // 图标而非文字（党哥 2026-10-18 要求）：三态 = 待机无声波 / 暂停单弧压暗 /
+      // 播放双弧；SVG 矢量 + fillColor 跟随 palette.text（四套主题通用）。
+      // ⚠️ 不走 Shape/Path：Path commands 是**物理 px**，viewPort 声明式缩放实测
+      // 不生效（API26 模拟器，2026-10-19，findings §17.8）—— 20vp 的框里图标
+      // 只有 11×16px，且墨色贴在框顶导致与相邻数字不居中。SVG 由渲染器缩放，
+      // 与 DPR 无关；28vp 整框进 Row，VerticalAlign.Center 保证与数字居中对齐。
       if (this.ttsSupported) {
-        this.speakerIcon(this.speakActive ? (this.speakPaused ? 1 : 2) : 0)
+        Image(this.speakActive
+          ? (this.speakPaused ? $r('app.media.ic_speaker_paused') : $r('app.media.ic_speaker_playing'))
+          : $r('app.media.ic_speaker_idle'))
+          .width(SPEAKER_ICON_VP)
+          .height(SPEAKER_ICON_VP)
+          .fillColor(this.palette.text)
+          .margin({ left: RR_SP_MD })
+          // 视觉 28vp，热区 56×44：触摸标准 ≥44（上下各撑 8，左右各撑 14）
+          .responseRegion({ x: -14, y: -8, width: 56, height: 44 })
+          .accessibilityText(this.speakActive ? (this.speakPaused ? '继续朗读' : '暂停朗读') : '开始朗读')
+          .onClick(() => this.toggleSpeak())
       }
     }
     .width('100%')
@@ -1138,65 +1158,6 @@ struct Reader {
     .padding({ left: RR_SP_2XL, right: RR_SP_3XL, top: RR_SP_XL, bottom: RR_SP_2XL })
     .backgroundColor(this.palette.overlay)
     .border({ width: { bottom: 1 }, color: this.palette.lineSoft })
-  }
-
-  /**
-   * 喇叭图标（topBar 朗读入口；党哥 2026-10-18 要求：图标优于文字）。
-   * 三态：0 = 待机（描边喇叭、无声波）/ 1 = 暂停（实心 + 单弧半透明）/
-   *       2 = 播放（实心 + 双弧）。20×20 线性图标，颜色跟随 palette.text。
-   * 声波用 Q 二次曲线（不用 A 弧命令 —— 路径解析器对弧的支持没验证过，不赌）。
-   * 交互属性（热区/无障碍/点击）一并收在 Builder 内 —— @Builder 方法调用的
-   * 返回值是 void，不能在外面链式挂属性（ArkTS 10505001）。
-   */
-  /**
-   * 喇叭图标（topBar 朗读入口；党哥 2026-10-18 要求：图标优于文字）。
-   * 三态：0 = 待机（描边喇叭、无声波）/ 1 = 暂停（实心 + 单弧半透明）/
-   *       2 = 播放（实心 + 双弧）。20×20vp 线性图标，颜色跟随 palette.text。
-   * 声波用 Q 二次曲线（不用 A 弧命令 —— 路径解析器对弧的支持没验证过，不赌）。
-   * ⚠️ Path 的 commands 单位是 **px 不是 vp**（官方 shape.d.ts 明示）—— 直接写
-   * 0~24 的图标坐标在 20vp 上只剩一个像素点（2026-10-18 实测看不见）。
-   * 解法：viewport({0,0,24,24}) 声明坐标空间，Shape 尺寸负责缩放，与 DPR 无关。
-   * 交互属性（热区/无障碍/点击）一并收在 Builder 内 —— @Builder 方法调用的
-   * 返回值是 void，不能在外面链式挂属性（ArkTS 10505001）。
-   */
-  @Builder
-  speakerIcon(state: number) {
-    Shape() {
-      // 喇叭本体：矩形振膜 + 三角号筒（绝对路径，24×24 图标坐标）
-      Path()
-        .commands('M4 9 L7 9 L12 5 L12 19 L7 15 L4 15 Z')
-        .fill(this.palette.text)
-        .fillOpacity(state === 0 ? 0 : 1)
-        .stroke(this.palette.text)
-        .strokeWidth(1.4)
-        .strokeLineJoin(LineJoinStyle.Round)
-      // 内弧（暂停/播放都有；暂停时压暗表示"哑音"）
-      if (state >= 1) {
-        Path()
-          .commands('M15.5 9.5 Q17.5 12 15.5 14.5')
-          .fillOpacity(0)
-          .stroke(this.palette.text)
-          .strokeWidth(1.4)
-          .strokeOpacity(state === 1 ? 0.45 : 1)
-          .strokeLineCap(LineCapStyle.Round)
-      }
-      // 外弧（仅播放）
-      if (state === 2) {
-        Path()
-          .commands('M18.5 6.5 Q21.5 12 18.5 17.5')
-          .fillOpacity(0)
-          .stroke(this.palette.text)
-          .strokeWidth(1.4)
-          .strokeLineCap(LineCapStyle.Round)
-      }
-    }
-    .width(20)
-    .height(20)
-    .viewPort({ x: 0, y: 0, width: 24, height: 24 })
-    .margin({ left: RR_SP_MD })
-    .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
-    .accessibilityText(state === 0 ? '开始朗读' : (state === 1 ? '继续朗读' : '暂停朗读'))
-    .onClick(() => this.toggleSpeak())
   }
 
   @Builder

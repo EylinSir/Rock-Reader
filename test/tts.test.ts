@@ -8,7 +8,15 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitSpeakSegments, SpeakQueue, SPEAK_SEGMENT_TARGET } from '../entry/src/main/ets/engine/tts/SpeakQueue.ets';
+import {
+  splitSpeakSegments,
+  SpeakQueue,
+  SPEAK_SEGMENT_TARGET,
+  SPEAK_CHAPTER_TARGET,
+  resumeCutIndex,
+  updateCharsPerSec,
+  normalizeForTts
+} from '../entry/src/main/ets/engine/tts/SpeakQueue.ets';
 
 // ---------------------------------------------------------------
 // splitSpeakSegments
@@ -176,4 +184,234 @@ test('queue：resume 只在 paused 态有效', () => {
   assert.equal(q.resume(), null, 'idle 态 resume 无效');
   q.begin();
   assert.equal(q.resume(), null, 'speaking 态 resume 无效');
+});
+
+// ---------------------------------------------------------------
+// 章级朗读（2026-10-18 修订：段 = 合成单元，默认 8000/段，findings §16.9）
+// ---------------------------------------------------------------
+
+test('chapter：短章（绝大多数章节）→ 一段读完，零接缝', () => {
+  const q = new SpeakQueue();
+  // 3000 字段落：远低于 8000 目标 → 最后句界收一段
+  let text = '';
+  for (let i = 0; i < 300; i++) {
+    text += '这是第' + i + '句话。';
+  }
+  assert.equal(q.loadChapter(text), 1);
+  assert.equal(q.begin(), text);
+  assert.equal(q.advance(), null, '一段读完即整章读完');
+  assert.equal(q.state, 'stopped');
+});
+
+test('chapter：超长章 → 多段但每段 ≤ 8000 且句界收段、不漏字', () => {
+  const q = new SpeakQueue();
+  let text = '';
+  for (let i = 0; i < 1200; i++) {
+    text += '这是第' + i + '句话。';
+  }
+  const n: number = q.loadChapter(text);
+  assert.ok(n >= 2, `1.2 万字应切 2 段以上，实际 ${n}`);
+  assert.ok(q.segmentOffset(0) === 0, '首段从章首开始');
+  for (let k = 0; k < n; k++) {
+    const off: number = q.segmentOffset(k);
+    assert.ok(off >= 0);
+    if (k > 0) {
+      assert.ok(off > q.segmentOffset(k - 1), '段偏移单调递增');
+    }
+  }
+  // 切段规则同 splitSpeakSegments：章级 minRatio=1，8000 目标下段长 ≤ 8000
+  const segs: string[] = splitSpeakSegments(text, SPEAK_CHAPTER_TARGET, 1);
+  assert.equal(n, segs.length);
+  for (const s of segs) {
+    assert.ok(s.length <= SPEAK_CHAPTER_TARGET, `段超限: ${s.length}`);
+  }
+  // 章级语义验证：第一段必须逼近 8000 才切（不是 1600 就切）
+  assert.ok(segs[0].length > 7000, `章级首段应尽量长: ${segs[0].length}`);
+});
+
+test('chapter：段偏移与文本对得上（位置估算的基数）', () => {
+  const q = new SpeakQueue();
+  const text = '甲。'.repeat(100) + '乙。'.repeat(100) + '丙。'.repeat(100); // 600 字
+  q.loadChapter(text);
+  // 600 字 < 8000 → 一段；偏移 0
+  assert.equal(q.total, 1);
+  assert.equal(q.segmentOffset(0), 0);
+  assert.equal(q.currentLength(), -1, '未 begin 时无当前段');
+  q.begin();
+  assert.equal(q.currentLength(), text.length);
+});
+
+test('seekTo：段内偏移 → 切在句界后开读，偏移基数同步', () => {
+  const q = new SpeakQueue();
+  // 下标：春0眠1不2觉3晓4，5处6处7闻8啼9鸟10。11夜12来13...
+  const text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。';
+  q.loadChapter(text);
+  const tail: string | null = q.seekTo(13); // 「夜来」中间 → 回退到 index11 的句号后
+  assert.equal(tail, '夜来风雨声，花落知多少。');
+  assert.equal(q.cursorIndex, 0);
+  assert.equal(q.segmentOffset(0), 12, '段起点后移到切点（估算连续）');
+});
+
+test('seekTo：偏移处即句界 → 句号后开读（不吃句号）', () => {
+  const q = new SpeakQueue();
+  const text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。';
+  q.loadChapter(text);
+  const tail: string | null = q.seekTo(11); // 正踩第一个句号
+  assert.equal(tail, '夜来风雨声，花落知多少。');
+  assert.equal(q.segmentOffset(0), 12);
+});
+
+test('seekTo：回退超限（病态长句中部）→ 就地切，不硬回退', () => {
+  const q = new SpeakQueue();
+  const text = '无标点的长句'.repeat(200); // 1400 字无句界
+  q.loadChapter(text);
+  const tail: string | null = q.seekTo(700); // 前后 120 字内都无句界
+  assert.ok(tail !== null);
+  assert.equal(tail, text.substring(700), '回退超限就地从 offset 切');
+  assert.equal(q.segmentOffset(0), 700);
+});
+
+test('seekTo：段首偏移 → 整段读（不切）；负偏移防御 → null', () => {
+  const q = new SpeakQueue();
+  const text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。';
+  q.loadChapter(text);
+  assert.equal(q.seekTo(0), text);
+  assert.equal(q.seekTo(-5), null, '负偏移防御：返回 null 由调用方忽略');
+});
+
+test('seekTo：跨段偏移 → 落到目标段', () => {
+  const q = new SpeakQueue();
+  let text = '';
+  for (let i = 0; i < 1200; i++) {
+    text += '这是第' + i + '句话。';
+  }
+  const n: number = q.loadChapter(text);
+  assert.ok(n >= 2);
+  const midOff: number = q.segmentOffset(1) + 5; // 第二段中部
+  const tail: string | null = q.seekTo(midOff);
+  assert.ok(tail !== null);
+  assert.equal(q.cursorIndex, 1);
+  // 从第二段中部最近句界后开读（切点落在回退上限内）
+  assert.ok((tail as string).length < 8000);
+  assert.ok(q.segmentOffset(1) >= midOff - 120, '切点不早于回退上限前');
+});
+
+test('seekTo：偏移超全部段 → null（读完了）', () => {
+  const q = new SpeakQueue();
+  q.loadChapter('春眠不觉晓。');
+  assert.equal(q.seekTo(99999), null);
+});
+
+test('seekTo：纯文本手术，不碰状态机（paused 保持 paused）', () => {
+  const q = new SpeakQueue();
+  const text = '春眠不觉晓，处处闻啼鸟。夜来风雨声，花落知多少。';
+  q.loadChapter(text);
+  q.begin();
+  q.pause();
+  q.seekTo(11);
+  assert.equal(q.state, 'paused', '暂停中跳页只移恢复点，不开读');
+  assert.equal(q.resume(), '夜来风雨声，花落知多少。', '继续从新位置读');
+});
+
+test('markSpeaking：idle/stopped → speaking；speaking/paused 不变', () => {
+  const q = new SpeakQueue();
+  q.loadChapter('甲。乙。');
+  q.markSpeaking();
+  assert.equal(q.state, 'speaking');
+  q.pause();
+  q.markSpeaking();
+  assert.equal(q.state, 'paused', 'paused 不被 markSpeaking 冲掉');
+  q.stop();
+  q.markSpeaking();
+  assert.equal(q.state, 'speaking');
+});
+
+test('resumeCutIndex：句界后开读 / 回退找句界 / 超限就地切', () => {
+  // 下标：春0眠1不2觉3晓4。5夜6来7风8雨9声10。11
+  assert.equal(resumeCutIndex('春眠不觉晓。夜来风雨声。', 0), 0, 'offset 0 → 0');
+  assert.equal(resumeCutIndex('春眠不觉晓。夜来风雨声。', 5), 6, 'offset 处即句号 → 句号后开读');
+  assert.equal(resumeCutIndex('春眠不觉晓。夜来风雨声。', 8), 6, '回退到句号后');
+  assert.equal(resumeCutIndex('春眠不觉晓。夜来风雨声。', 100), 12, '超长 offset 夹到文长');
+  const noPunct = '无标点长句'.repeat(100);
+  assert.equal(resumeCutIndex(noPunct, 500), 500, '回退超限就地切');
+  assert.equal(resumeCutIndex(noPunct, 500), resumeCutIndex(noPunct, 500), '纯函数可重复');
+});
+
+test('updateCharsPerSec：EMA 校准 / 脏值防御 / 夹取', () => {
+  // 4000 字播了 900 秒 ≈ 4.44 字/秒：向默认 4.5 收敛
+  const cps: number = updateCharsPerSec(4.5, 4000, 900);
+  assert.ok(cps > 4.3 && cps < 4.7, `EMA 结果异常: ${cps}`);
+  // 瞬段（秒数 ≤ 0.3）是噪声，不采纳
+  assert.equal(updateCharsPerSec(4.5, 10, 0.1), 4.5);
+  // 非正 chars/seconds 不回退
+  assert.equal(updateCharsPerSec(4.5, 0, 10), 4.5);
+  assert.equal(updateCharsPerSec(4.5, 10, 0), 4.5);
+  // 极端快/慢夹在 [2, 12]（EMA 收敛方向 + 夹取）
+  assert.equal(updateCharsPerSec(11, 10000, 1), 12, '极端快 → 夹上限');
+  assert.equal(updateCharsPerSec(2.5, 1, 100), 2, '极端慢 → 夹下限');
+  // 单调收敛：持续同速率样本 → 逼近该速率
+  let c: number = 4.5;
+  for (let i = 0; i < 20; i++) {
+    c = updateCharsPerSec(c, 500, 100); // 5 字/秒
+  }
+  assert.ok(Math.abs(c - 5) < 0.1, `EMA 应收敛到 5: ${c}`);
+});
+
+// ---------------------------------------------------------------
+// TTS 文本规范化（党哥 2026-10-19 实听反馈：单引号/英文标点出问题）
+// ---------------------------------------------------------------
+
+test('normalize：引号类（中英文单双引）→ 空格', () => {
+  assert.equal(normalizeForTts("他说'是的'"), '他说 是的 ');
+  assert.equal(normalizeForTts('他说"好的"'), '他说 好的 ');
+  assert.equal(normalizeForTts("It's fine"), 'It s fine');
+  // 直双引号与弯引号一视同仁
+  assert.equal(normalizeForTts('\u201c引用\u201d'), ' 引用 ');
+});
+
+test('normalize：破折号 → 空格', () => {
+  assert.equal(normalizeForTts('话没说完——'), '话没说完  ');
+  assert.equal(normalizeForTts('a–b'), 'a b');
+});
+
+test('normalize：英文标点 → 中文等价', () => {
+  assert.equal(normalizeForTts('Hello, world: ok; fine! really?'), 'Hello， world： ok； fine！ really？');
+  assert.equal(normalizeForTts('Mr. Smith went home.'), 'Mr。 Smith went home。');
+});
+
+test('normalize：数字间的英文句点保留（小数点/缩写点）', () => {
+  assert.equal(normalizeForTts('圆周率是3.14'), '圆周率是3.14');
+  assert.equal(normalizeForTts('版本1.2.3发布'), '版本1.2.3发布');
+  assert.equal(normalizeForTts('a.b'), 'a。b', '非数字邻点仍转换');
+});
+
+test('normalize：等长性是硬约束（Reader 用原始偏移 seekTo）', () => {
+  const samples: string[] = [
+    "他说'是的'，然后\"走了\"——离开。",
+    'Hello, world! Test: ok; done?',
+    '3.14 和 Mr. Smith 与 a.b 混排',
+    '\u201c\u2018弯引号\u2019\u201d直引号"',
+    ''
+  ];
+  for (const s of samples) {
+    const n: string = normalizeForTts(s);
+    assert.equal(n.length, s.length, `等长被破坏: ${s}`);
+  }
+  // 中文标点原样不动
+  assert.equal(normalizeForTts('春眠不觉晓，处处闻啼鸟。'), '春眠不觉晓，处处闻啼鸟。');
+});
+
+test('normalize+load：seekTo 偏移在含引号/英文标点的章节里依然对齐', () => {
+  const q = new SpeakQueue();
+  // 原文里 offset=k 的位置，规范化后必须还是同一句话（等长替换）
+  const text = '甲说\'你好\'，然后离开了。乙说"再见"，也走了。丙还在原地。';
+  q.loadChapter(text);
+  assert.equal(q.total, 1);
+  // 第一个中文句号在 offset 12（\'你好\'，然后离开了。→ 引号变空格但位置不变）
+  const tail: string | null = q.seekTo(13);
+  assert.ok(tail !== null);
+  // 从 offset 13 回退找句界：句号在 12 → 从 13 开读 = '乙说"再见"，也走了。丙还在原地。'
+  // （规范化后引号是空格）
+  assert.equal(tail, '乙说 再见 ，也走了。丙还在原地。');
+  assert.equal(q.segmentOffset(0), 13);
 });

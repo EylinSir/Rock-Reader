@@ -22,19 +22,23 @@
  *      1002300003 音色不支持 / 1002300005 建引擎失败。
  *   6. extraParams['isBackStage'] = true 可开后合播放（期二 AVSession 的替代路径）。
  *
- * 关键约束（两次实测，结论翻转过，以最新为准）：
+ * 关键约束（三次实测，结论翻转过，以最新为准）：
  *   1. **模拟器有 TTS 能力**（2026-10-18 jscrash 日志实锤）：createEngine 成功
  *      （version 61.29.11.202，连 com.huawei.hmsapp.hiai TtsAbility，code 0）。
  *      此前"无库/无工具/hidumper 无 SA"的判断有盲区 —— TTS 是 hiai 应用内的
  *      ExtensionAbility + AI_TEXT 原生模块，本就不在 hidumper 的 SA 列表里。
- *      语音是否出声（音频通路）待模拟器实测；真机仍是最终验收环境。
+ *      语音整链路（建引擎→speak→翻页续读→暂停/停止）均已在模拟器实测通过。
  *   2. **成功回调的 err 是 undefined 不是 null**（同次实锤）：createEngine 成功后
  *      原生侧 callback(undefined, engine)，判定必须同时防 null 和 undefined。
+ *   3. **章级朗读**（2026-10-18 修订）：段从页级 500 字改章级 8000 字
+ *      （findings §16.9：小段接缝 = 停顿莫名/连读/翻页中断三大听感问题的总根因）。
+ *      代价是段内无官方断点 → 位置跟踪（时间估算 + 段播完校准 + 句界回退续读），
+ *      见 estimatedOffset / resumeNow / SpeakQueue.seekTo。
  */
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { textToSpeech } from '@kit.CoreSpeechKit';
 import { BusinessError } from '@kit.BasicServicesKit';
-import { SpeakQueue, SpeakState } from './SpeakQueue';
+import { SpeakQueue, SpeakState, updateCharsPerSec } from './SpeakQueue';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'RockReaderTts';
@@ -48,6 +52,11 @@ const TTS_ONLINE_MODE: number = 1;
 const TTS_PERSON: number = 13;
 /** 语速默认值（常速） */
 const DEFAULT_SPEED: number = 1.0;
+/**
+ * 语速估算初值（ chars/sec，中文女声常速约 4~6 字/秒）。
+ * 仅第一段用；第二段起用段播完的实际时长校准（updateCharsPerSec EMA）。
+ */
+const DEFAULT_CPS: number = 4.5;
 
 /** 音色不支持错误码（如凌飞哲未下载）：设备 TTS 能力没问题，不污染 supported 缓存 */
 const TTS_ERR_VOICE_UNSUPPORTED: number = 1002300003;
@@ -60,8 +69,8 @@ const TTS_ERR_VOICE_UNSUPPORTED: number = 1002300003;
  * class 实例走 new，不碰字面量规则；字段默认 null，调用处判空。
  */
 export class TtsCallbacks {
-  /** 某段开始播报（UI 显示 段 x/y） */
-  onSegmentStart: ((index: number, total: number) => void) | null = null;
+  /** 某段开始播报（index/total 段号；charOffset = 该段在章内起始偏移，UI 算百分比） */
+  onSegmentStart: ((index: number, total: number, charOffset: number) => void) | null = null;
   /** 某段播完 */
   onSegmentDone: ((index: number, total: number) => void) | null = null;
   /** 全部段播完 */
@@ -95,6 +104,14 @@ export class TtsEngine {
   private callbacks: TtsCallbacks = new TtsCallbacks();
   /** requestId 序号（同一实例内 requestId 只能有一次，官方文档明确要求） */
   private reqSeq: number = 0;
+  /** 当前有效 speak 的 requestId（过期回调凭它丢弃：seek 换段/暂停后的压哨事件） */
+  private activeReqId: string = '';
+  /** 当前段 onStart 时刻（位置估算的时间基点） */
+  private segStartMs: number = 0;
+  /** 暂停时冻结的章内偏移（-1 = 无冻结值）；续读从这句界回退点开读 */
+  private pausedOffset: number = -1;
+  /** 语速估算（chars/sec，EMA 校准，见 updateCharsPerSec） */
+  private cps: number = DEFAULT_CPS;
 
   private constructor() {
   }
@@ -185,6 +202,37 @@ export class TtsEngine {
     return this.queue.load(text);
   }
 
+  /** 载入**整章**并切段（章级朗读入口：默认 8000/段，绝大多数章节一段读完） */
+  loadChapter(text: string): number {
+    this.queue.stop();
+    return this.queue.loadChapter(text);
+  }
+
+  /**
+   * 章内当前播放位置（字符偏移）。-1 = 不在播（idle/stopped/未建引擎）。
+   * speaking = 段起点 + 已播秒数 × 估算语速（段播完时用实际时长校准）；
+   * paused = 暂停时冻结值。
+   * Reader 的 1s 定时器凭它做**页同步**（眼睛跟着耳朵走）。
+   */
+  estimatedOffset(): number {
+    if (this.engine === null || this.queue.cursorIndex < 0) {
+      return -1;
+    }
+    if (this.queue.state === 'paused') {
+      return this.pausedOffset;
+    }
+    if (this.queue.state !== 'speaking') {
+      return -1;
+    }
+    const base: number = this.queue.segmentOffset(this.queue.cursorIndex);
+    const segLen: number = this.queue.currentLength();
+    if (base < 0 || segLen < 0) {
+      return -1;
+    }
+    const played: number = (Date.now() - this.segStartMs) / 1000 * this.cps;
+    return base + Math.max(0, Math.min(played, segLen));
+  }
+
   /**
    * 开始朗读。**可能是异步的**：引擎首次创建（createEngine 是回调式）时，
    * 本方法返回 false 但后台会建引擎，建好自动续跑 beginNow。
@@ -221,8 +269,43 @@ export class TtsEngine {
     return true;
   }
 
+  /**
+   * 从章内偏移 offset 处开读（章级朗读的真正入口：用户点朗读时从**当前页**
+   * 开始，不是章首）。异步语义同 begin：引擎未建则后台建好自动续跑。
+   */
+  startFrom(offset: number): boolean {
+    if (this.supported === false) {
+      return false;
+    }
+    if (this.engine !== null) {
+      return this.startFromNow(offset);
+    }
+    const off: number = offset;
+    this.ensureEngine((ok: boolean, reason: string) => {
+      if (ok) {
+        this.startFromNow(off);
+      } else {
+        this.callbacks.onError?.(reason.length > 0 ? reason : '当前设备不支持朗读');
+      }
+    });
+    return false;
+  }
+
+  private startFromNow(offset: number): boolean {
+    const tail: string | null = this.queue.seekTo(offset);
+    if (tail === null) {
+      return false;
+    }
+    this.queue.markSpeaking();
+    this.speakCurrent(tail);
+    return true;
+  }
+
   pause(): void {
     if (this.engine !== null && this.queue.state === 'speaking') {
+      // 冻结当前位置（估算值）—— 续读从这里按句界回退开播。
+      // 必须在 engine.stop() **之前**取：stop 后段内时间基点就失去意义了。
+      this.pausedOffset = this.estimatedOffset();
       this.engine.stop();
     }
     this.queue.pause();
@@ -245,13 +328,53 @@ export class TtsEngine {
     return false;
   }
 
+  /**
+   * 续读（章级语义）：从暂停时的冻结偏移开播，按句界回退切当前段
+   * （CoreSpeechKit 无段内断点，回退到上一个句号是唯一诚实的近似；
+   *  重听量通常只有一句话，见 SpeakQueue.resumeCutIndex）。
+   */
   private resumeNow(): boolean {
+    if (this.pausedOffset >= 0) {
+      const tail: string | null = this.queue.seekTo(this.pausedOffset);
+      this.pausedOffset = -1;
+      if (tail === null) {
+        return false;
+      }
+      this.queue.markSpeaking();
+      this.speakCurrent(tail);
+      return true;
+    }
+    // 防御路径：从没定位过就暂停（理论不出现）→ 旧语义整段重读
     const cur: string | null = this.queue.resume();
     if (cur === null) {
       return false;
     }
     this.speakCurrent(cur);
     return true;
+  }
+
+  /**
+   * 跳转到章内偏移 offset（用户手动翻页：耳朵跟眼睛走）。
+   * paused 时只做文本手术 + 后移恢复点，不开读（点「继续」才读）；
+   * 其余状态手术后立即开播。
+   */
+  seekTo(offset: number): void {
+    if (this.engine === null || this.queue.total === 0) {
+      return;
+    }
+    const wasPaused: boolean = this.queue.state === 'paused';
+    const tail: string | null = this.queue.seekTo(offset);
+    if (tail === null) {
+      return;
+    }
+    if (wasPaused) {
+      // 恢复点 = 新段起点（seekTo 已把段切在句界上）
+      this.pausedOffset = this.queue.segmentOffset(this.queue.cursorIndex);
+      return;
+    }
+    this.queue.markSpeaking();
+    this.engine.stop();
+    this.speakCurrent(tail);
   }
 
   /** 停止（UI「停止」；队列复位，再 begin 从第一段来） */
@@ -265,6 +388,7 @@ export class TtsEngine {
   /** 页面销毁必须调（引擎持有音频资源；不释放=进程内泄漏+下次 begin 行为未定义） */
   shutdown(): void {
     this.stop();
+    this.activeReqId = ''; // 之后的迟到回调全部按过期丢弃
     if (this.engine !== null) {
       try {
         this.engine.shutdown();
@@ -366,9 +490,17 @@ export class TtsEngine {
     // 字段用**方法语法**（箭头函数属性值会踩 arkts-no-untyped-obj-literals 的推导坑，见 NOOP_CALLBACKS 注释）
     const listener: textToSpeech.SpeakListener = {
       onStart(requestId: string, _response: textToSpeech.StartResponse): void {
+        // 过期事件守卫（requestId 版）：seekTo 换段/暂停后的压哨 onStart 一律丢弃。
+        // 比状态判断更硬 —— stop 是异步的，旧 speak 的回调可能晚于新 speak 到达。
+        if (requestId !== self.activeReqId) {
+          hilog.info(DOMAIN, TAG, 'onStart stale, dropped: id=%{public}s', requestId);
+          return;
+        }
+        self.segStartMs = Date.now();
         hilog.info(DOMAIN, TAG, 'onStart: id=%{public}s seg=%{public}d/%{public}d',
           requestId, self.queue.cursorIndex + 1, self.queue.total);
-        self.callbacks.onSegmentStart?.(self.queue.cursorIndex, self.queue.total);
+        self.callbacks.onSegmentStart?.(self.queue.cursorIndex, self.queue.total,
+          self.queue.segmentOffset(self.queue.cursorIndex));
       },
       onComplete(requestId: string, response: textToSpeech.CompleteResponse): void {
         // type 0 = 合成完成（音频还没播完！），type 1 = 播放完成。
@@ -376,10 +508,13 @@ export class TtsEngine {
         if (response.type !== 1) {
           return;
         }
-        // 过期事件守卫（2026-10-18 补）：引擎 stop 是异步的，用户暂停/停止后
-        // 段尾的 onComplete(type 1) 可能压哨到达。此时队列已非 speaking
-        // （pause→paused / stop→stopped）→ 这是死信，丢弃：
-        // 不推进（否则把暂停态冲掉），更不触发 onAllDone（否则无故翻页）。
+        if (requestId !== self.activeReqId) {
+          hilog.info(DOMAIN, TAG, 'onComplete stale, dropped: id=%{public}s', requestId);
+          return;
+        }
+        // 过期事件守卫（状态版）：用户暂停/停止后段尾 onComplete 压哨到达。
+        // 此时队列已非 speaking → 死信，丢弃：不推进（否则把暂停态冲掉），
+        // 更不触发 onAllDone（否则无故翻页）。
         if (self.queue.state !== 'speaking') {
           hilog.info(DOMAIN, TAG, 'onComplete stale (state=%{public}s), dropped: id=%{public}s',
             self.queue.state, requestId);
@@ -387,6 +522,11 @@ export class TtsEngine {
         }
         hilog.info(DOMAIN, TAG, 'onComplete: id=%{public}s seg=%{public}d/%{public}d',
           requestId, self.queue.cursorIndex + 1, self.queue.total);
+        // 段播完：用实际播放时长校准语速估算（位置同步/续读准不准全靠它）。
+        // 必须在 advance() **之前**取当前段长度。
+        const doneChars: number = self.queue.currentLength();
+        const secs: number = (Date.now() - self.segStartMs) / 1000;
+        self.cps = updateCharsPerSec(self.cps, doneChars, secs);
         const done: number = self.queue.cursorIndex;
         const total: number = self.queue.total;
         self.callbacks.onSegmentDone?.(done, total);
@@ -402,6 +542,12 @@ export class TtsEngine {
         // 这里不碰状态机 —— 否则"播完自动 stopped"会被 onStop 误清
       },
       onError(requestId: string, errorCode: number, errorMessage: string): void {
+        if (requestId !== self.activeReqId) {
+          // 旧 speak 的残错误（seek 换段后被 stop 的那个）—— 不上抛，免幽灵提示
+          hilog.info(DOMAIN, TAG, 'onError stale, dropped: id=%{public}s code=%{public}d',
+            requestId, errorCode);
+          return;
+        }
         hilog.error(DOMAIN, TAG, 'speak onError: id=%{public}s code=%{public}d msg=%{public}s',
           requestId, errorCode, errorMessage);
         self.callbacks.onError?.(errorMessage);
@@ -410,7 +556,7 @@ export class TtsEngine {
     return listener;
   }
 
-  /** speak 当前段（内部：调用前必须已 ensureReady + 队列已 begin/resume） */
+  /** speak 当前段（内部：调用前必须已 ensureReady + 队列已 begin/seek/resume） */
   private speakCurrent(text: string): void {
     const eng: textToSpeech.TextToSpeechEngine | null = this.engine;
     if (eng === null) {
@@ -426,6 +572,7 @@ export class TtsEngine {
     //   ReaderPrefs.ttsSpeed 已就位，真机验证时一并接上：届时若官方 SDK 放开，
     //   补 `const extra: Record<string, Object> = { speed: this.speed }` 即可。
     const params: textToSpeech.SpeakParams = { requestId: 'rr-' + Date.now() + '-' + this.reqSeq };
+    this.activeReqId = params.requestId;
     try {
       eng.speak(text, params);
     } catch (e) {

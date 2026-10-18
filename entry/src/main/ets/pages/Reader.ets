@@ -240,11 +240,11 @@ struct Reader {
   /** 章加载失败态：true 时 persistProgress 禁止落库（防进度被清成 0，审查报告 B2） */
   private failed: boolean = false;
 
-  // ---- 朗读（TTS，2026-10-17 加）----
+  // ---- 朗读（TTS，2026-10-17 加；2026-10-18 改章级）----
   /**
    * 引擎单例跨 Reader 页生命周期复用（aboutToDisappear 才 shutdown）。
-   * 能力探测在 aboutToAppear 触发；模拟器无 TTS 能力 → ttsSupported 保持 false
-   * → 入口不渲染（用户完全感知不到，findings §15）。
+   * 能力探测在 aboutToAppear 触发；探测失败 → ttsSupported 保持 false
+   * → 入口不渲染（用户完全感知不到）。
    */
   private tts: TtsEngine = TtsEngine.shared();
   /** 设备支持 TTS（探测结论）；false = 隐藏全部朗读入口 */
@@ -257,8 +257,14 @@ struct Reader {
   @State speakPaused: boolean = false;
   /** begin 已发起但首段未开播的瞬态（createEngine 异步） */
   @State speakPreparing: boolean = false;
-  /** 播放条进度文案，如 '3/12'；准备中为 '准备中' */
+  /** 播放条进度文案：章级朗读 = 章内百分比（如 '32%'）；准备中为 '准备中' */
   @State speakProgress: string = '';
+  /** 队列当前载入的章序号（≠ chapterIndex = 跨章了，showPage 时须重载） */
+  private speakChapterIndex: number = -1;
+  /** 位置同步翻页标记：定时器驱动的 showPage 不重载朗读（纯视觉跟随） */
+  private speakSyncing: boolean = false;
+  /** 位置跟踪定时器 id（-1 = 未运行；speakActive 期间每 1s 报一次章内偏移） */
+  private speakTimer: number = -1;
 
   aboutToAppear(): void {
     // 下载的字体**每次启动都要重新注册**（registerFont 只在进程内存活，不持久化）
@@ -278,15 +284,18 @@ struct Reader {
     // ArkTS 坑（2026-10-17 实测）：对象字面量的**属性值为箭头函数表达式**时会踩
     // arkts-no-untyped-obj-literals（类型推导失效）；先用显式函数类型变量接住，再作属性值。
     // （方法语法 onXxx(): void {} 也可过，但闭包要抓 this —— 方法内 this 指向字面量本身，不可用。）
-    const onSegStart: (index: number, total: number) => void = (index: number, total: number): void => {
-      this.speakPreparing = false;
-      this.speakPaused = false;
-      this.speakActive = true;
-      this.speakProgress = `${index + 1}/${total}`;
-    };
+    const onSegStart: (index: number, total: number, charOffset: number) => void =
+      (index: number, total: number, charOffset: number): void => {
+        this.speakPreparing = false;
+        this.speakPaused = false;
+        this.speakActive = true;
+        this.speakProgress = this.chapterPercent(charOffset);
+        this.startSpeakTimer();
+      };
     const onAllDone: () => void = (): void => {
-      // 本页读完：能翻页就翻（showPage 会自动重载新页续读，见 showPage 尾部），
-      // 全书末页则收工。跨章同理：openChapter 最终也走 showPage。
+      // 整章读完：能翻页就翻（跨章后 openChapter → showPage 会重载新章续读，
+      // 见 showPage 尾部），全书末章则收工。同章内不存在"读完还有剩页"
+      // （段覆盖全章文本，最后一段结束 = 章尾）。
       const canForward: boolean = this.pageIndex < this.pageCount - 1
         || this.chapterIndex < this.chapterCount - 1;
       if (canForward) {
@@ -295,6 +304,7 @@ struct Reader {
         this.speakActive = false;
         this.speakPaused = false;
         this.speakProgress = '';
+        this.stopSpeakTimer();
       }
     };
     const onErr: (msg: string) => void = (msg: string): void => {
@@ -302,6 +312,7 @@ struct Reader {
       this.speakActive = false;
       this.speakPaused = false;
       this.speakProgress = '';
+      this.stopSpeakTimer();
       // 音色试听失败（如凌飞哲未下载 → createEngine 1002300003）：
       // 选中态/prefs/引擎全部回退默认音色 —— 别把用户卡在坏选项上，
       // 且给一句明确提示（静默失败最难排查）。
@@ -430,6 +441,7 @@ struct Reader {
   aboutToDisappear(): void {
     this.persistProgress(true);
     this.flushSession();
+    this.stopSpeakTimer();
     // 无条件 shutdown（幂等）：speakActive 时要停播；仅探测过没开读时，
     // probe 留下的引擎也必须释放（否则进程内常驻音频资源）
     this.tts.shutdown();
@@ -634,37 +646,68 @@ struct Reader {
       ? 0
       : (this.chapterIndex + this.pagePercent) / this.chapterCount;
     this.persistProgress(false);
-    // 朗读中翻页（用户手动翻 / onAllDone 自动翻 / 跨章 openChapter 后）：重载新页续读。
-    // 手动翻页 = 阅读位置变了，朗读跟着走（微信读书行为，别让耳朵和眼睛岔开）。
-    // 暂停中翻页 = 换页不自动开读，点「继续」从新页第一段来（见 toggleSpeak）。
-    if (this.speakActive) {
-      this.reloadSpeakCurrent(this.speakPaused);
+    // 朗读中的页面切换，三种来路分流（章级朗读，2026-10-18）：
+    // ① speakSyncing（定时器页同步）：纯视觉跟随，音频队列不动；
+    // ② 跨章（目录跳章 / 章末自动翻）：队列里是旧章文本 → reloadSpeakCurrent
+    //    重载新章全文开读（跨章后停在第 0 页 = 章首）；
+    // ③ 同章内用户手动翻页：耳朵跟眼睛走 —— seekTo 跳到新页起始偏移续读
+    //    （暂停中只后移恢复点，不开读；点「继续」从新位置读）。
+    if (this.speakActive && !this.speakSyncing) {
+      if (this.speakChapterIndex !== this.chapterIndex) {
+        this.reloadSpeakCurrent();
+      } else {
+        this.tts.seekTo(range.start);
+        if (this.speakPaused) {
+          this.speakProgress = '已换页';
+        }
+      }
     }
   }
 
   // ------------------------------------------------------------------
-  // 朗读（TTS）控制
+  // 朗读（TTS）控制 —— 章级朗读（2026-10-18 修订，findings §16.9）
+  // 音频按章连续播，翻页只是视觉跟随；暂停/继续用句界回退续读。
   // ------------------------------------------------------------------
 
-  /** 开始朗读当前页（topBar「朗读」入口 / 暂停后「继续」共用） */
+  /** 章内百分比文案（播放条显示；空章防除零） */
+  private chapterPercent(charOffset: number): string {
+    const len: number = this.chapterText.length;
+    if (len <= 0) {
+      return '0%';
+    }
+    const pct: number = Math.floor(Math.max(0, Math.min(charOffset, len)) / len * 100);
+    return pct + '%';
+  }
+
+  /** 当前页在章内的起始字符偏移（朗读定位/跳转的统一基准） */
+  private pageStartOffset(): number {
+    if (this.pages.length === 0 || this.pageIndex >= this.pages.length) {
+      return 0;
+    }
+    return this.pages[this.pageIndex].start;
+  }
+
+  /** 开始朗读：载入**整章**，从当前页位置开播（微信读书行为：点哪读哪） */
   private startSpeak(): void {
     if (!this.ttsSupported) {
       return;
     }
-    const n: number = this.tts.loadText(this.pageText);
+    const n: number = this.tts.loadChapter(this.chapterText);
+    this.speakChapterIndex = this.chapterIndex;
     if (n === 0) {
-      this.hint = '本页没有可读的内容';
+      this.hint = '本章没有可读的内容';
       return;
     }
     this.speakPreparing = true;
     this.speakProgress = '准备中';
     this.speakPaused = false;
-    if (this.tts.begin()) {
+    if (this.tts.startFrom(this.pageStartOffset())) {
       // 同步路径：引擎已就绪，首段已 speak（onSegmentStart 会到）
       this.speakActive = true;
       this.speakPreparing = false;
+      this.startSpeakTimer();
     }
-    // begin 返回 false 且无 onError 到 = 引擎创建中的瞬态：
+    // startFrom 返回 false 且无 onError 到 = 引擎创建中的瞬态：
     // speakActive 由 onSegmentStart 置 true；期间播放条不显示（避免"假播放条"）
   }
 
@@ -675,16 +718,17 @@ struct Reader {
       return;
     }
     if (this.speakPaused) {
-      // 继续：队列可能已被翻页时的 reloadSpeakCurrent 复位（state=idle），
-      // 此时 resume 无效 → 走 begin 从新页第一段读
+      // 继续：从暂停点（句界回退后）续读。队列被跨章重载成 idle 的防御路径
+      // 走 startFrom(当前页偏移) —— 正常暂停态队列是 paused + cursor 已定位。
       if (this.tts.state === 'paused') {
         this.tts.resume();
       } else {
-        this.tts.begin();
+        this.tts.startFrom(this.pageStartOffset());
       }
       this.speakPaused = false;
       this.speakPreparing = true;
       this.speakProgress = '准备中';
+      this.startSpeakTimer();
     } else {
       this.tts.pause();
       this.speakPaused = true;
@@ -698,27 +742,64 @@ struct Reader {
     this.speakPaused = false;
     this.speakPreparing = false;
     this.speakProgress = '';
+    this.speakChapterIndex = -1;
+    this.stopSpeakTimer();
   }
 
   /**
-   * 翻页后重载当前页文本续读。
-   * @param keepPaused true = 暂停中翻页：只换文本不开读（点「继续」才读），
-   *        此时队列停在 idle + cursor 0 待续；false = 立即开读新页第一段。
+   * 跨章续读（章读完自动翻章 / 用户从目录跳章）：载入新章全文并开读。
+   * 同章内的翻页不走这里（走 seekTo，见 showPage 尾部）。
    */
-  private reloadSpeakCurrent(keepPaused: boolean): void {
-    const n: number = this.tts.loadText(this.pageText);
+  private reloadSpeakCurrent(): void {
+    const n: number = this.tts.loadChapter(this.chapterText);
+    this.speakChapterIndex = this.chapterIndex;
     if (n === 0) {
       this.stopSpeak();
-      return;
-    }
-    if (keepPaused) {
-      // 队列 load 后 state=idle/cursor=-1；「继续」按钮走 begin 分支（见 toggleSpeak）
-      this.speakProgress = '已换页';
       return;
     }
     this.speakPreparing = true;
     this.speakProgress = '准备中';
     this.tts.begin();
+  }
+
+  // ---- 位置跟踪（章级朗读的"眼睛跟耳朵走"）----
+
+  private startSpeakTimer(): void {
+    if (this.speakTimer >= 0) {
+      return;
+    }
+    this.speakTimer = setInterval(() => this.onSpeakTick(), 1000);
+  }
+
+  private stopSpeakTimer(): void {
+    if (this.speakTimer >= 0) {
+      clearInterval(this.speakTimer);
+      this.speakTimer = -1;
+    }
+  }
+
+  /** 每秒：更新章内百分比 + 页同步（音频位置驱动的翻页不碰朗读队列） */
+  private onSpeakTick(): void {
+    if (!this.speakActive || this.speakPaused) {
+      return;
+    }
+    const off: number = this.tts.estimatedOffset();
+    if (off < 0) {
+      return;
+    }
+    this.speakProgress = this.chapterPercent(off);
+    if (this.pages.length === 0) {
+      return;
+    }
+    const target: number = pageOfChar(this.pages, off) - 1;
+    if (target < 0 || target === this.pageIndex) {
+      return;
+    }
+    // speakSyncing = 本次 showPage 是音频跟随，不是用户翻页：
+    // showPage 尾部据此跳过 seekTo（否则音频被自己的页同步打断）。
+    this.speakSyncing = true;
+    this.showPage(target);
+    this.speakSyncing = false;
   }
 
   // ------------------------------------------------------------------
@@ -1044,18 +1125,12 @@ struct Reader {
         .fontSize(RR_FS_MICRO)
         .fontFamily('monospace')
         .fontColor(this.palette.text3)
-      // 朗读入口：仅设备支持 TTS 时渲染（模拟器/低端机完全看不到，findings §15）。
-      // 放标题行而不是底部四等分按钮行 —— 不破坏「上一章/目录/Aa/下一章」的构图，
-      // 且与章节计数同款等宽小字，视觉重量对等。
+      // 朗读入口：仅设备支持 TTS 时渲染（探测失败的设备完全看不到）。
+      // 放标题行而不是底部四等分按钮行 —— 不破坏「上一章/目录/Aa/下一章」的构图。
+      // 图标而非文字（党哥 2026-10-18 要求）：三态 = 待机描边喇叭 / 暂停实心单弧 /
+      // 播放实心双弧；热区在 Builder 内撑到 56×44 保证触摸标准。
       if (this.ttsSupported) {
-        Text(this.speakActive ? (this.speakPaused ? '继续' : '暂停') : '朗读')
-          .fontSize(RR_FS_MICRO)
-          .fontFamily('monospace')
-          .fontColor(this.palette.text)
-          .margin({ left: RR_SP_MD })
-          .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
-          .accessibilityText(this.speakActive ? '暂停朗读' : '开始朗读')
-          .onClick(() => this.toggleSpeak())
+        this.speakerIcon(this.speakActive ? (this.speakPaused ? 1 : 2) : 0)
       }
     }
     .width('100%')
@@ -1063,6 +1138,65 @@ struct Reader {
     .padding({ left: RR_SP_2XL, right: RR_SP_3XL, top: RR_SP_XL, bottom: RR_SP_2XL })
     .backgroundColor(this.palette.overlay)
     .border({ width: { bottom: 1 }, color: this.palette.lineSoft })
+  }
+
+  /**
+   * 喇叭图标（topBar 朗读入口；党哥 2026-10-18 要求：图标优于文字）。
+   * 三态：0 = 待机（描边喇叭、无声波）/ 1 = 暂停（实心 + 单弧半透明）/
+   *       2 = 播放（实心 + 双弧）。20×20 线性图标，颜色跟随 palette.text。
+   * 声波用 Q 二次曲线（不用 A 弧命令 —— 路径解析器对弧的支持没验证过，不赌）。
+   * 交互属性（热区/无障碍/点击）一并收在 Builder 内 —— @Builder 方法调用的
+   * 返回值是 void，不能在外面链式挂属性（ArkTS 10505001）。
+   */
+  /**
+   * 喇叭图标（topBar 朗读入口；党哥 2026-10-18 要求：图标优于文字）。
+   * 三态：0 = 待机（描边喇叭、无声波）/ 1 = 暂停（实心 + 单弧半透明）/
+   *       2 = 播放（实心 + 双弧）。20×20vp 线性图标，颜色跟随 palette.text。
+   * 声波用 Q 二次曲线（不用 A 弧命令 —— 路径解析器对弧的支持没验证过，不赌）。
+   * ⚠️ Path 的 commands 单位是 **px 不是 vp**（官方 shape.d.ts 明示）—— 直接写
+   * 0~24 的图标坐标在 20vp 上只剩一个像素点（2026-10-18 实测看不见）。
+   * 解法：viewport({0,0,24,24}) 声明坐标空间，Shape 尺寸负责缩放，与 DPR 无关。
+   * 交互属性（热区/无障碍/点击）一并收在 Builder 内 —— @Builder 方法调用的
+   * 返回值是 void，不能在外面链式挂属性（ArkTS 10505001）。
+   */
+  @Builder
+  speakerIcon(state: number) {
+    Shape() {
+      // 喇叭本体：矩形振膜 + 三角号筒（绝对路径，24×24 图标坐标）
+      Path()
+        .commands('M4 9 L7 9 L12 5 L12 19 L7 15 L4 15 Z')
+        .fill(this.palette.text)
+        .fillOpacity(state === 0 ? 0 : 1)
+        .stroke(this.palette.text)
+        .strokeWidth(1.4)
+        .strokeLineJoin(LineJoinStyle.Round)
+      // 内弧（暂停/播放都有；暂停时压暗表示"哑音"）
+      if (state >= 1) {
+        Path()
+          .commands('M15.5 9.5 Q17.5 12 15.5 14.5')
+          .fillOpacity(0)
+          .stroke(this.palette.text)
+          .strokeWidth(1.4)
+          .strokeOpacity(state === 1 ? 0.45 : 1)
+          .strokeLineCap(LineCapStyle.Round)
+      }
+      // 外弧（仅播放）
+      if (state === 2) {
+        Path()
+          .commands('M18.5 6.5 Q21.5 12 18.5 17.5')
+          .fillOpacity(0)
+          .stroke(this.palette.text)
+          .strokeWidth(1.4)
+          .strokeLineCap(LineCapStyle.Round)
+      }
+    }
+    .width(20)
+    .height(20)
+    .viewPort({ x: 0, y: 0, width: 24, height: 24 })
+    .margin({ left: RR_SP_MD })
+    .responseRegion({ x: -8, y: -8, width: 56, height: 44 })
+    .accessibilityText(state === 0 ? '开始朗读' : (state === 1 ? '继续朗读' : '暂停朗读'))
+    .onClick(() => this.toggleSpeak())
   }
 
   @Builder
